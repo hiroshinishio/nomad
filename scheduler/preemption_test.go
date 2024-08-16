@@ -5,14 +5,19 @@ package scheduler
 
 import (
 	"fmt"
+	"maps"
+	"slices"
 	"strconv"
 	"testing"
 
 	"github.com/hashicorp/nomad/ci"
+	"github.com/hashicorp/nomad/client/lib/numalib"
+	"github.com/hashicorp/nomad/client/lib/numalib/hw"
 	"github.com/hashicorp/nomad/helper/uuid"
 	"github.com/hashicorp/nomad/nomad/mock"
 	"github.com/hashicorp/nomad/nomad/structs"
 	psstructs "github.com/hashicorp/nomad/plugins/shared/structs"
+	"github.com/shoenig/test/must"
 	"github.com/stretchr/testify/require"
 )
 
@@ -146,7 +151,331 @@ func TestResourceDistance(t *testing.T) {
 
 }
 
-func TestPreemption(t *testing.T) {
+func makeNodeResources(devices []*structs.NodeDeviceResource, busAssociativity map[string]hw.NodeID) *structs.NodeResources {
+	makeCore := func(node hw.NodeID, id hw.CoreID) numalib.Core {
+		sockets := map[hw.NodeID]hw.SocketID{
+			0: 0,
+			1: 0,
+			2: 1,
+			3: 1,
+		}
+		return numalib.Core{
+			NodeID:    node,
+			SocketID:  sockets[node],
+			ID:        id,
+			Grade:     numalib.Performance,
+			BaseSpeed: 4000,
+		}
+	}
+
+	// 2 socket, 4 numa node system, 2 cores per node
+	processors := structs.NodeProcessorResources{
+		Topology: &numalib.Topology{
+			Nodes: []uint8{0, 1, 2, 3},
+			Distances: numalib.SLIT{
+				[]numalib.Cost{10, 12, 32, 32},
+				[]numalib.Cost{12, 10, 32, 32},
+				[]numalib.Cost{32, 32, 10, 12},
+				[]numalib.Cost{32, 32, 12, 10},
+			},
+			Cores: []numalib.Core{
+				makeCore(0, 0),
+				makeCore(0, 1),
+				makeCore(1, 2),
+				makeCore(1, 3),
+				makeCore(2, 4),
+				makeCore(2, 5),
+				makeCore(3, 6),
+				makeCore(3, 7),
+			},
+		},
+	}
+
+	defaultNodeResources := &structs.NodeResources{
+		Processors: processors,
+		Memory: structs.NodeMemoryResources{
+			MemoryMB: 8192,
+		},
+		Disk: structs.NodeDiskResources{
+			DiskMB: 100 * 1024,
+		},
+		Networks: []*structs.NetworkResource{
+			{
+				Device: "eth0",
+				CIDR:   "192.168.0.100/32",
+				MBits:  1000,
+			},
+		},
+		Devices: devices,
+	}
+
+	defaultNodeResources.Compatibility()
+
+	defaultNodeResources.Processors.Topology.BusAssociativity = maps.Clone(busAssociativity)
+
+	return defaultNodeResources
+}
+
+func makeDeviceInstance(instanceID, busID string) *structs.NodeDevice {
+	return &structs.NodeDevice{
+		ID:      instanceID,
+		Healthy: true,
+		Locality: &structs.NodeDeviceLocality{
+			PciBusID: busID,
+		},
+	}
+}
+
+func TestPreemption_NUMA_require(t *testing.T) {
+	ci.Parallel(t)
+
+	type testCase struct {
+		name                 string
+		currentAllocations   []*structs.Allocation
+		nodeReservedCapacity *structs.NodeReservedResources
+		nodeCapacity         *structs.NodeResources
+		resourceAsk          *structs.Resources
+		currentPreemptions   []*structs.Allocation
+		expPreemptedAllocIDs []string
+	}
+
+	lowPrioJob := mock.Job()
+	lowPrioJob.Priority = 30
+
+	// Create some persistent alloc ids to use in test cases
+	allocIDs := []string{uuid.Generate(), uuid.Generate(), uuid.Generate()}
+
+	nodeResources := makeNodeResources([]*structs.NodeDeviceResource{
+		{
+			Type:   "gpu",
+			Vendor: "nvidia",
+			Name:   "1080ti",
+			Attributes: map[string]*psstructs.Attribute{
+				"memory":           psstructs.NewIntAttribute(11, psstructs.UnitGiB),
+				"cuda_cores":       psstructs.NewIntAttribute(3584, ""),
+				"graphics_clock":   psstructs.NewIntAttribute(1480, psstructs.UnitMHz),
+				"memory_bandwidth": psstructs.NewIntAttribute(11, psstructs.UnitGBPerS),
+			},
+			Instances: []*structs.NodeDevice{
+				makeDeviceInstance("GPU-1", "0000:01:01.0"),
+				makeDeviceInstance("GPU-2", "0000:06:01.1"),
+			},
+		},
+		{
+			Type:   "gpu",
+			Vendor: "nvidia",
+			Name:   "2080ti",
+			Attributes: map[string]*psstructs.Attribute{
+				"memory":           psstructs.NewIntAttribute(11, psstructs.UnitGiB),
+				"cuda_cores":       psstructs.NewIntAttribute(3584, ""),
+				"graphics_clock":   psstructs.NewIntAttribute(1480, psstructs.UnitMHz),
+				"memory_bandwidth": psstructs.NewIntAttribute(11, psstructs.UnitGBPerS),
+			},
+			Instances: []*structs.NodeDevice{
+				makeDeviceInstance("GPU-3", "0000:02:01.0"),
+				makeDeviceInstance("GPU-4", "0000:02:02.0"),
+				makeDeviceInstance("GPU-5", "0000:07:01.0"),
+				makeDeviceInstance("GPU-6", "0000:08:02.0"),
+				makeDeviceInstance("GPU-7", "0000:09:08.0"),
+			},
+		},
+		{
+			Type:   "fpga",
+			Vendor: "intel",
+			Name:   "F100",
+			Attributes: map[string]*psstructs.Attribute{
+				"memory": psstructs.NewIntAttribute(4, psstructs.UnitGiB),
+			},
+			Instances: []*structs.NodeDevice{
+				makeDeviceInstance("FPGA-1", "0000:01:06.0"),
+				makeDeviceInstance("FPGA-2", "0000:09:06.0"),
+			},
+		},
+	}, map[string]hw.NodeID{
+		"0000:01:01.0": 0, // 1080ti GPU-1
+		"0000:06:01.1": 1, // 1080ti GPU-2
+
+		"0000:02:01.0": 0, // 2080ti GPU-3
+		"0000:02:02.0": 0, // 2080ti GPU-4
+		"0000:07:01.0": 1, // 2080ti GPU-5
+		"0000:08:02.0": 2, // 2080ti GPU-6
+		"0000:09:08.0": 3, // 2080ti GPU-7
+
+		"0000:01:06.0": 0, // F100 FPGA-1
+		"0000:09:06.0": 3, // F100 FPGA-2
+	})
+
+	// just a value we can ignore for cpu, memory, disk in these tests
+	const ignore = 100
+
+	testCases := []testCase{
+		{
+			name: "Preempt the alloc using 1080ti on node 0 because we also want f100",
+			currentAllocations: []*structs.Allocation{
+				createAllocWithDevice(allocIDs[0], lowPrioJob, &structs.Resources{
+					CPU:      ignore,
+					MemoryMB: ignore,
+					DiskMB:   ignore,
+				}, &structs.AllocatedDeviceResource{
+					Type:      "gpu",
+					Vendor:    "nvidia",
+					Name:      "1080ti",
+					DeviceIDs: []string{"GPU-1"},
+				}),
+			},
+			nodeCapacity: nodeResources,
+			resourceAsk: &structs.Resources{
+				CPU:      ignore,
+				MemoryMB: ignore,
+				DiskMB:   ignore,
+				NUMA: &structs.NUMA{
+					Affinity: "require",
+					Devices: []string{
+						"nvidia/gpu/1080ti",
+						"intel/fpga/F100",
+					},
+				},
+				Devices: []*structs.RequestedDevice{
+					{
+						Name:  "nvidia/gpu/1080ti",
+						Count: 1,
+					},
+					{
+						Name:  "intel/fpga/F100",
+						Count: 1,
+					},
+				},
+			},
+			expPreemptedAllocIDs: []string{allocIDs[0]},
+		},
+		{
+			name:               "Want two 1080ti on same node but is not possible",
+			currentAllocations: nil,
+			nodeCapacity:       nodeResources,
+			resourceAsk: &structs.Resources{
+				CPU:      ignore,
+				MemoryMB: ignore,
+				DiskMB:   ignore,
+				NUMA: &structs.NUMA{
+					Affinity: "require",
+					Devices: []string{
+						"nvidia/gpu/1080ti",
+					},
+				},
+				Devices: []*structs.RequestedDevice{
+					{
+						Name:  "nvidia/gpu/1080ti",
+						Count: 2,
+					},
+				},
+			},
+			expPreemptedAllocIDs: nil,
+		},
+		{
+			name: "Preempt GPU-3 and FPGA-1 because we want 2 2080ti along with FPGA-1",
+			currentAllocations: []*structs.Allocation{
+				createAllocWithDevice(allocIDs[0], lowPrioJob, &structs.Resources{
+					CPU:      ignore,
+					MemoryMB: ignore,
+					DiskMB:   ignore,
+				}, &structs.AllocatedDeviceResource{
+					Type:      "gpu",
+					Vendor:    "nvidia",
+					Name:      "2080ti",
+					DeviceIDs: []string{"GPU-3"},
+				}),
+				createAllocWithDevice(allocIDs[1], lowPrioJob, &structs.Resources{
+					CPU:      ignore,
+					MemoryMB: ignore,
+					DiskMB:   ignore,
+				}, &structs.AllocatedDeviceResource{
+					Type:      "fpga",
+					Vendor:    "intel",
+					Name:      "F100",
+					DeviceIDs: []string{"FPGA-1"},
+				}),
+			},
+			nodeCapacity: nodeResources,
+			resourceAsk: &structs.Resources{
+				CPU:      ignore,
+				MemoryMB: ignore,
+				DiskMB:   ignore,
+				NUMA: &structs.NUMA{
+					Affinity: "require",
+					Devices: []string{
+						"nvidia/gpu/2080ti",
+						"intel/fpga/F100",
+					},
+				},
+				Devices: []*structs.RequestedDevice{
+					{
+						Name:  "nvidia/gpu/2080ti",
+						Count: 2,
+					},
+					{
+						Name:  "intel/fpga/F100",
+						Count: 1,
+					},
+				},
+			},
+			expPreemptedAllocIDs: []string{allocIDs[0], allocIDs[1]},
+		},
+	}
+
+	for _, tc := range testCases {
+		t.Run(tc.name, func(t *testing.T) {
+			node := mock.Node()
+			node.NodeResources = tc.nodeCapacity
+			node.ReservedResources = tc.nodeReservedCapacity
+
+			state, ctx := testContext(t)
+
+			nodes := []*RankedNode{{Node: node}}
+			state.UpsertNode(structs.MsgTypeTestSetup, 1000, node)
+			for _, alloc := range tc.currentAllocations {
+				alloc.NodeID = node.ID
+			}
+			must.NoError(t, state.UpsertAllocs(structs.MsgTypeTestSetup, 1001, tc.currentAllocations))
+
+			if tc.currentPreemptions != nil {
+				ctx.plan.NodePreemptions[node.ID] = tc.currentPreemptions
+			}
+			const jobPriority = 100
+			static := NewStaticRankIterator(ctx, nodes)
+			binPackIter := NewBinPackIterator(ctx, static, true, jobPriority)
+			job := mock.Job()
+			job.Priority = jobPriority
+			binPackIter.SetJob(job)
+			binPackIter.SetSchedulerConfiguration(testSchedulerConfig)
+
+			taskGroup := &structs.TaskGroup{
+				EphemeralDisk: &structs.EphemeralDisk{},
+				Tasks: []*structs.Task{
+					{
+						Name:      "web",
+						Resources: tc.resourceAsk,
+					},
+				},
+			}
+
+			binPackIter.SetTaskGroup(taskGroup)
+			option := binPackIter.Next()
+			if tc.expPreemptedAllocIDs == nil {
+				must.Nil(t, option)
+			} else {
+				must.NotNil(t, option)
+				preemptedAllocs := option.PreemptedAllocs
+				must.Eq(t, len(tc.expPreemptedAllocIDs), len(preemptedAllocs), must.Sprintf("option %#v", option))
+				for _, alloc := range preemptedAllocs {
+					exists := slices.Contains(tc.expPreemptedAllocIDs, alloc.ID)
+					must.True(t, exists, must.Sprintf("alloc %s was preempted unexpectedly", alloc.ID))
+				}
+			}
+		})
+	}
+}
+
+func TestPreemption_Normal(t *testing.T) {
 	ci.Parallel(t)
 
 	type testCase struct {
@@ -182,6 +511,7 @@ func TestPreemption(t *testing.T) {
 	defaultNodeResources := &structs.NodeResources{
 		Processors: processorResources,
 		Cpu:        legacyCpuResources,
+
 		Memory: structs.NodeMemoryResources{
 			MemoryMB: 8192,
 		},
@@ -207,22 +537,10 @@ func TestPreemption(t *testing.T) {
 					"memory_bandwidth": psstructs.NewIntAttribute(11, psstructs.UnitGBPerS),
 				},
 				Instances: []*structs.NodeDevice{
-					{
-						ID:      deviceIDs[0],
-						Healthy: true,
-					},
-					{
-						ID:      deviceIDs[1],
-						Healthy: true,
-					},
-					{
-						ID:      deviceIDs[2],
-						Healthy: true,
-					},
-					{
-						ID:      deviceIDs[3],
-						Healthy: true,
-					},
+					makeDeviceInstance(deviceIDs[0], "0000:00:00.0"),
+					makeDeviceInstance(deviceIDs[1], "0000:00:01.0"),
+					makeDeviceInstance(deviceIDs[2], "0000:00:02.0"),
+					makeDeviceInstance(deviceIDs[3], "0000:00:03.0"),
 				},
 			},
 			{
@@ -236,26 +554,11 @@ func TestPreemption(t *testing.T) {
 					"memory_bandwidth": psstructs.NewIntAttribute(11, psstructs.UnitGBPerS),
 				},
 				Instances: []*structs.NodeDevice{
-					{
-						ID:      deviceIDs[4],
-						Healthy: true,
-					},
-					{
-						ID:      deviceIDs[5],
-						Healthy: true,
-					},
-					{
-						ID:      deviceIDs[6],
-						Healthy: true,
-					},
-					{
-						ID:      deviceIDs[7],
-						Healthy: true,
-					},
-					{
-						ID:      deviceIDs[8],
-						Healthy: true,
-					},
+					makeDeviceInstance(deviceIDs[4], "0000:00:04.0"),
+					makeDeviceInstance(deviceIDs[5], "0000:00:05.0"),
+					makeDeviceInstance(deviceIDs[6], "0000:00:06.0"),
+					makeDeviceInstance(deviceIDs[7], "0000:00:07.0"),
+					makeDeviceInstance(deviceIDs[8], "0000:00:08.0"),
 				},
 			},
 			{
@@ -266,14 +569,8 @@ func TestPreemption(t *testing.T) {
 					"memory": psstructs.NewIntAttribute(4, psstructs.UnitGiB),
 				},
 				Instances: []*structs.NodeDevice{
-					{
-						ID:      "fpga1",
-						Healthy: true,
-					},
-					{
-						ID:      "fpga2",
-						Healthy: false,
-					},
+					makeDeviceInstance("fpga1", "0000:01:00.0"),
+					makeDeviceInstance("fpga2", "0000:02:01.0"),
 				},
 			},
 		},

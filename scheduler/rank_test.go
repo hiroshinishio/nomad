@@ -13,6 +13,7 @@ import (
 	"github.com/hashicorp/nomad/helper/uuid"
 	"github.com/hashicorp/nomad/nomad/mock"
 	"github.com/hashicorp/nomad/nomad/structs"
+	"github.com/shoenig/test/must"
 	"github.com/stretchr/testify/require"
 )
 
@@ -1904,10 +1905,13 @@ func TestBinPackIterator_Devices(t *testing.T) {
 
 	for _, c := range cases {
 		t.Run(c.Name, func(t *testing.T) {
-			require := require.New(t)
-
 			// Setup the context
 			state, ctx := testContext(t)
+
+			// Canonicalize resources
+			for _, task := range c.TaskGroup.Tasks {
+				task.Resources.Canonicalize()
+			}
 
 			// Add the planned allocs
 			if len(c.PlannedAllocs) != 0 {
@@ -1923,7 +1927,7 @@ func TestBinPackIterator_Devices(t *testing.T) {
 				for _, alloc := range c.ExistingAllocs {
 					alloc.NodeID = c.Node.ID
 				}
-				require.NoError(state.UpsertAllocs(structs.MsgTypeTestSetup, 1000, c.ExistingAllocs))
+				must.NoError(t, state.UpsertAllocs(structs.MsgTypeTestSetup, 1000, c.ExistingAllocs))
 			}
 
 			static := NewStaticRankIterator(ctx, []*RankedNode{{Node: c.Node}})
@@ -1939,7 +1943,7 @@ func TestBinPackIterator_Devices(t *testing.T) {
 			// Check we got the placements we are expecting
 			for tname, devices := range c.ExpectedPlacements {
 				tr, ok := out.TaskResources[tname]
-				require.True(ok)
+				must.True(t, ok)
 
 				want := len(devices)
 				got := 0
@@ -1947,20 +1951,20 @@ func TestBinPackIterator_Devices(t *testing.T) {
 					got++
 
 					expected, ok := devices[*placed.ID()]
-					require.True(ok)
-					require.Equal(expected.Count, len(placed.DeviceIDs))
+					must.True(t, ok)
+					must.Eq(t, expected.Count, len(placed.DeviceIDs))
 					for _, id := range expected.ExcludeIDs {
-						require.NotContains(placed.DeviceIDs, id)
+						must.SliceNotContains(t, placed.DeviceIDs, id)
 					}
 				}
 
-				require.Equal(want, got)
+				must.Eq(t, want, got)
 			}
 
 			// Check potential affinity scores
 			if c.DeviceScore != 0.0 {
-				require.Len(out.Scores, 2)
-				require.Equal(c.DeviceScore, out.Scores[1])
+				must.Len(t, 2, out.Scores)
+				must.Eq(t, c.DeviceScore, out.Scores[1])
 			}
 		})
 	}
@@ -2054,6 +2058,7 @@ func TestBinPackIterator_Device_Failure_With_Eviction(t *testing.T) {
 							Count: 1,
 						},
 					},
+					NUMA: &structs.NUMA{Affinity: structs.NoneNUMA},
 				},
 			},
 		},
@@ -2067,13 +2072,324 @@ func TestBinPackIterator_Device_Failure_With_Eviction(t *testing.T) {
 	scoreNorm := NewScoreNormalizationIterator(ctx, binp)
 
 	out := collectRanked(scoreNorm)
-	require := require.New(t)
 
 	// We expect a placement failure because we need 1 GPU device
 	// and the other one is taken
+	must.SliceEmpty(t, out)
+	must.Eq(t, 1, ctx.metrics.DimensionExhausted["devices: no devices match request"])
+}
 
-	require.Len(out, 0)
-	require.Equal(1, ctx.metrics.DimensionExhausted["devices: no devices match request"])
+// Test ensures we can acquire devices across NUMA nodes if the affinity is only
+// at the prefer mode.
+func TestBinPackIterator_Device_NUMA_prefer_split(t *testing.T) {
+	_, ctx := testContext(t)
+
+	nodes := []*RankedNode{
+		{
+			Node: &structs.Node{
+				NodeResources: &structs.NodeResources{
+					Processors: processorResources4096,
+					Cpu:        legacyCpuResources4096,
+					Memory:     structs.NodeMemoryResources{MemoryMB: 4096},
+					Networks:   []*structs.NetworkResource{},
+					Devices: []*structs.NodeDeviceResource{
+						{
+							Vendor: "nvidia",
+							Type:   "gpu",
+							Name:   "t1000",
+							Instances: []*structs.NodeDevice{
+								{
+									ID:      "GPU-1",
+									Healthy: true,
+									Locality: &structs.NodeDeviceLocality{
+										PciBusID: "0000:03:01.1", // numa node 0
+									},
+								},
+							},
+						},
+						{
+							Vendor: "intel",
+							Type:   "net",
+							Name:   "xxv710",
+							Instances: []*structs.NodeDevice{
+								{
+									ID:      "NET-1",
+									Healthy: true,
+									Locality: &structs.NodeDeviceLocality{
+										PciBusID: "0000:09:01.1", // numa node 1
+									},
+								},
+							},
+						},
+					},
+				},
+			},
+		},
+	}
+
+	// assign hardware addresses to numa nodes
+	nodes[0].Node.NodeResources.Processors.Topology.BusAssociativity = map[string]hw.NodeID{
+		"0000:03:01.1": 0,
+		"0000:09:01.1": 1,
+	}
+
+	// Create task group with gpu and net device, with numa affinity required
+	taskGroup := &structs.TaskGroup{
+		EphemeralDisk: new(structs.EphemeralDisk),
+		Tasks: []*structs.Task{
+			{
+				Name: "task",
+				Resources: &structs.Resources{
+					CPU:      2000,
+					MemoryMB: 1024,
+					Networks: []*structs.NetworkResource{},
+					Devices: structs.ResourceDevices{
+						{
+							Name:  "nvidia/gpu/t1000",
+							Count: 1,
+						},
+						{
+							Name:  "intel/net/xxv710",
+							Count: 1,
+						},
+					},
+					NUMA: &structs.NUMA{
+						Affinity: structs.PreferNUMA,
+						Devices: []string{
+							"nvidia/gpu/t1000",
+							"intel/net/xxv710",
+						},
+					},
+				},
+			},
+		},
+		Networks: []*structs.NetworkResource{},
+	}
+
+	static := NewStaticRankIterator(ctx, nodes)
+	binp := NewBinPackIterator(ctx, static, true, 0)
+	binp.SetTaskGroup(taskGroup)
+	binp.SetSchedulerConfiguration(testSchedulerConfig)
+	scoreNorm := NewScoreNormalizationIterator(ctx, binp)
+	out := collectRanked(scoreNorm)
+
+	must.SliceLen(t, 1, out)
+	must.Zero(t, ctx.metrics.DimensionExhausted["devices: no devices match request"])
+}
+
+// Tests that required devices split across numa nodes when the affinity mode is
+// required will fail even though the devices are available.
+func TestBinPackIterator_Device_NUMA_require_split(t *testing.T) {
+	_, ctx := testContext(t)
+
+	nodes := []*RankedNode{
+		{
+			Node: &structs.Node{
+				NodeResources: &structs.NodeResources{
+					Processors: processorResources4096,
+					Cpu:        legacyCpuResources4096,
+					Memory:     structs.NodeMemoryResources{MemoryMB: 4096},
+					Networks:   []*structs.NetworkResource{},
+					Devices: []*structs.NodeDeviceResource{
+						{
+							Vendor: "nvidia",
+							Type:   "gpu",
+							Name:   "t1000",
+							Instances: []*structs.NodeDevice{
+								{
+									ID:      "GPU-1",
+									Healthy: true,
+									Locality: &structs.NodeDeviceLocality{
+										PciBusID: "0000:03:01.1", // numa node 0
+									},
+								},
+							},
+						},
+						{
+							Vendor: "intel",
+							Type:   "net",
+							Name:   "xxv710",
+							Instances: []*structs.NodeDevice{
+								{
+									ID:      "NET-1",
+									Healthy: true,
+									Locality: &structs.NodeDeviceLocality{
+										PciBusID: "0000:09:01.1", // numa node 1
+									},
+								},
+							},
+						},
+					},
+				},
+			},
+		},
+	}
+
+	// assign hardware addresses to numa nodes
+	nodes[0].Node.NodeResources.Processors.Topology.BusAssociativity = map[string]hw.NodeID{
+		"0000:03:01.1": 0,
+		"0000:09:01.1": 1,
+	}
+
+	// Create task group with gpu and net device, with numa affinity required
+	taskGroup := &structs.TaskGroup{
+		EphemeralDisk: new(structs.EphemeralDisk),
+		Tasks: []*structs.Task{
+			{
+				Name: "task",
+				Resources: &structs.Resources{
+					CPU:      2000,
+					MemoryMB: 1024,
+					Networks: []*structs.NetworkResource{},
+					Devices: structs.ResourceDevices{
+						{
+							Name:  "nvidia/gpu/t1000",
+							Count: 1,
+						},
+						{
+							Name:  "intel/net/xxv710",
+							Count: 1,
+						},
+					},
+					NUMA: &structs.NUMA{
+						Affinity: structs.RequireNUMA,
+						Devices: []string{
+							"nvidia/gpu/t1000",
+							"intel/net/xxv710",
+						},
+					},
+				},
+			},
+		},
+		Networks: []*structs.NetworkResource{},
+	}
+
+	static := NewStaticRankIterator(ctx, nodes)
+	binp := NewBinPackIterator(ctx, static, true, 0)
+	binp.SetTaskGroup(taskGroup)
+	binp.SetSchedulerConfiguration(testSchedulerConfig)
+	scoreNorm := NewScoreNormalizationIterator(ctx, binp)
+	out := collectRanked(scoreNorm)
+
+	must.SliceEmpty(t, out)
+	must.Eq(t, 1, ctx.metrics.DimensionExhausted["devices: no devices match request"])
+}
+
+// Tests that we can acquire devices required to be on the same numa node along
+// with a device on another numa node that is not required.
+func TestBinPackIterator_Device_NUMA_require_mixed_with_arbitrary(t *testing.T) {
+	_, ctx := testContext(t)
+
+	nodes := []*RankedNode{
+		{
+			Node: &structs.Node{
+				NodeResources: &structs.NodeResources{
+					Processors: processorResources4096,
+					Cpu:        legacyCpuResources4096,
+					Memory:     structs.NodeMemoryResources{MemoryMB: 4096},
+					Networks:   []*structs.NetworkResource{},
+					Devices: []*structs.NodeDeviceResource{
+						{
+							Vendor: "nvidia",
+							Type:   "gpu",
+							Name:   "t1000",
+							Instances: []*structs.NodeDevice{
+								{
+									ID:      "GPU-1",
+									Healthy: true,
+									Locality: &structs.NodeDeviceLocality{
+										PciBusID: "0000:09:01.1", // numa node 1
+									},
+								},
+							},
+						},
+						{
+							Vendor: "intel",
+							Type:   "net",
+							Name:   "xxv710",
+							Instances: []*structs.NodeDevice{
+								{
+									ID:      "NET-1",
+									Healthy: true,
+									Locality: &structs.NodeDeviceLocality{
+										PciBusID: "0000:01:01.1", // numa node 0
+									},
+								},
+							},
+						},
+						{
+							Vendor: "xilinx",
+							Type:   "fpga",
+							Name:   "kintex-7",
+							Instances: []*structs.NodeDevice{
+								{
+									ID:      "FPGA-1",
+									Healthy: true,
+									Locality: &structs.NodeDeviceLocality{
+										PciBusID: "0000:02:01.0", // numa node 0
+									},
+								},
+							},
+						},
+					},
+				},
+			},
+		},
+	}
+
+	// assign hardware addresses to numa nodes
+	nodes[0].Node.NodeResources.Processors.Topology.BusAssociativity = map[string]hw.NodeID{
+		"0000:02:01.0": 0, // fpga, require
+		"0000:01:01.1": 0, // net, require
+		"0000:09:01.1": 1, // gpu, don't care
+	}
+
+	// Create task group with gpu and net device, with numa affinity required
+	taskGroup := &structs.TaskGroup{
+		EphemeralDisk: new(structs.EphemeralDisk),
+		Tasks: []*structs.Task{
+			{
+				Name: "task",
+				Resources: &structs.Resources{
+					CPU:      2000,
+					MemoryMB: 1024,
+					Networks: []*structs.NetworkResource{},
+					Devices: structs.ResourceDevices{
+						{
+							Name:  "nvidia/gpu/t1000",
+							Count: 1,
+						},
+						{
+							Name:  "intel/net/xxv710",
+							Count: 1,
+						},
+						{
+							Name:  "xilinx/fpga/kintex-7",
+							Count: 1,
+						},
+					},
+					NUMA: &structs.NUMA{
+						Affinity: structs.RequireNUMA,
+						Devices: []string{
+							"xilinx/fpga/kintex-7",
+							"intel/net/xxv710",
+						},
+					},
+				},
+			},
+		},
+		Networks: []*structs.NetworkResource{},
+	}
+
+	static := NewStaticRankIterator(ctx, nodes)
+	binp := NewBinPackIterator(ctx, static, true, 0)
+	binp.SetTaskGroup(taskGroup)
+	binp.SetSchedulerConfiguration(testSchedulerConfig)
+	scoreNorm := NewScoreNormalizationIterator(ctx, binp)
+	out := collectRanked(scoreNorm)
+
+	must.SliceLen(t, 1, out)
+	must.Zero(t, ctx.metrics.DimensionExhausted["devices: no devices match request"])
 }
 
 func TestJobAntiAffinity_PlannedAlloc(t *testing.T) {
